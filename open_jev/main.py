@@ -1,5 +1,5 @@
 """
-jev.py — A single-file reference implementation of a "System One" decision model.
+jev, A single-file reference implementation of a "System One" decision model.
 
 This is a from-first-principles reconstruction of the architecture described in
 TypeSafe's Jev launch material. It is a *teaching* implementation: every piece is
@@ -74,25 +74,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-
-__all__ = [
-    "JevConfig",
-    "Noul",
-    "Choice",
-    "Score",
-    "Question",
-    "NoulAnswer",
-    "ChoiceAnswer",
-    "ScoreAnswer",
-    "Answer",
-    "StateCache",
-    "Jev",
-    "RLCDLoss",
-    "HashTokenizer",
-    "stable_hash",
-    "flatten_state",
-]
-
 
 @dataclass(frozen=True)
 class JevConfig:
