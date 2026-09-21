@@ -94,11 +94,6 @@ __all__ = [
 ]
 
 
-# =============================================================================
-# 1. CONFIG
-# =============================================================================
-
-
 @dataclass(frozen=True)
 class JevConfig:
     """Hyperparameters for the whole model.
@@ -144,16 +139,10 @@ class JevConfig:
             raise ValueError("d_model must be divisible by n_heads")
 
 
-# =============================================================================
-# 2. TYPED QUESTIONS AND ANSWERS
-#
 # These dataclasses ARE the type safety. A Choice question declares its options
 # up front; the head builds a softmax whose support is exactly those options.
 # There is no vocabulary to wander off into, so a schema violation is not
 # "unlikely" -- it is unrepresentable.
-# =============================================================================
-
-
 @dataclass(frozen=True)
 class Noul:
     """Is this statement true? Returns a single calibrated probability.
@@ -228,16 +217,10 @@ class ScoreAnswer:
 Answer = NoulAnswer | ChoiceAnswer | ScoreAnswer
 
 
-# =============================================================================
-# 3. TOKENIZATION AND STATE FLATTENING
-#
 # A real deployment uses a proper BPE tokenizer. This hash tokenizer exists so
 # the file runs standalone. What matters here is `flatten_state`: it turns a
 # nested JSON object into (token, path) pairs, which is how the model gets
 # key-order invariance for free.
-# =============================================================================
-
-
 def stable_hash(text: str) -> int:
     """CRC32 of the utf-8 bytes.
 
@@ -332,11 +315,6 @@ def flatten_state(
     return ids[:max_len], paths[:max_len]
 
 
-# =============================================================================
-# 4. BUILDING BLOCKS
-# =============================================================================
-
-
 class FeedForward(nn.Module):
     """Standard pre-norm FFN with GELU."""
 
@@ -416,11 +394,6 @@ class ReadoutBlock(nn.Module):
         h = self.self_norm(slots)
         mixed, _ = self.slot_attn(h, h, h, need_weights=False)
         return self.ffn(slots + mixed)
-
-
-# =============================================================================
-# 5. ENCODERS
-# =============================================================================
 
 
 class StateEncoder(nn.Module):
@@ -506,11 +479,6 @@ class TextEncoder(nn.Module):
 
         keep = (~safe_mask).unsqueeze(-1).to(x.dtype)
         return (x * keep).sum(1) / keep.sum(1).clamp(min=1.0)
-
-
-# =============================================================================
-# 6. HEADS
-# =============================================================================
 
 
 class ConfidenceHead(nn.Module):
@@ -632,11 +600,6 @@ class ScoreHead(nn.Module):
         return (upper - lower).clamp(min=1e-8)  # [B, n_levels]
 
 
-# =============================================================================
-# 7. THE MODEL
-# =============================================================================
-
-
 @dataclass
 class StateCache:
     """An encoded state, ready to be queried repeatedly.
@@ -686,8 +649,6 @@ class Jev(nn.Module):
         self.score_head = ScoreHead(cfg)
         self.confidence_head = ConfidenceHead(cfg)
 
-    # -- state ---------------------------------------------------------------
-
     def encode_state(self, states: Sequence[StateValue]) -> StateCache:
         """Encode a batch of JSON-like states. Cache and reuse this."""
         device = next(self.parameters()).device
@@ -713,8 +674,6 @@ class Jev(nn.Module):
 
         hidden = self.state_encoder(ids, paths, pad)
         return StateCache(hidden=hidden, pad_mask=pad)
-
-    # -- read-out ------------------------------------------------------------
 
     def _readout(self, cache: StateCache, questions: Sequence[Question]) -> Tensor:
         """Run all questions against one state. Returns pooled vectors [B*N, d].
@@ -759,8 +718,6 @@ class Jev(nn.Module):
         device = next(self.parameters()).device
         ids, pad = self.tokenizer.encode_batch(list(options), self.cfg.max_question_len)
         return self.text_encoder(ids.to(device), pad.to(device))  # [K, d]
-
-    # -- public API ----------------------------------------------------------
 
     def forward(
         self, states: Sequence[StateValue], questions: Sequence[Question]
@@ -861,9 +818,6 @@ class Jev(nn.Module):
         return out
 
 
-# =============================================================================
-# 8. RLCD LOSS
-#
 # The single most important rule: NEVER train on hard labels.
 #
 # Cross-entropy against a one-hot target manufactures overconfidence, which is
@@ -879,9 +833,6 @@ class Jev(nn.Module):
 # The catch, worth being honest about: distillation caps you at the teacher, and
 # inherits the teacher's biases. Real outcome data, where you have it, is what
 # breaks that ceiling.
-# =============================================================================
-
-
 @dataclass
 class RLCDLoss:
     """Composite objective for calibrated decisions.
@@ -905,8 +856,6 @@ class RLCDLoss:
     w_ece: float = 0.1
     n_ece_bins: int = 10
     parts: dict[str, float] = field(default_factory=dict)
-
-    # -- components ----------------------------------------------------------
 
     @staticmethod
     def soft_nll(probs: Tensor, target: Tensor) -> Tensor:
@@ -945,8 +894,6 @@ class RLCDLoss:
             if w.sum() > 0:
                 total = total + w.mean() * ((w * (conf - acc)).sum() / w.sum()).abs()
         return total
-
-    # -- entry point ---------------------------------------------------------
 
     def __call__(
         self,
