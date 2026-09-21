@@ -8,6 +8,11 @@ __pycache__/
 
 # Distribution / packaging
 .Python
+.DS_Store
+.vscode/
+.vscode
+docs/
+docs
 build/
 develop-eggs/
 dist/
