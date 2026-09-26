@@ -59,7 +59,7 @@ def _demo() -> None:
     print("--- Answers (one forward pass, 4 questions) ---")
     for a in answers:
         if isinstance(a, NoulAnswer):
-            print(f"  {a.key:12s} noul={a.noul:.3f}")
+            print(f"  {a.key:12s} noul={a.noul:.3f} conf={a.confidence:.3f}")
         elif isinstance(a, ChoiceAnswer):
             dist = " ".join(f"{k}={v:.2f}" for k, v in a.probabilities.items())
             print(
@@ -89,7 +89,8 @@ def _demo() -> None:
         for x, y in zip(answers, alt)
         if isinstance(x, NoulAnswer) and isinstance(y, NoulAnswer)
     )
-    print(f"  [ok] key-shuffle drift on Noul: {drift:.4f} (untrained; trained -> ~0)")
+    assert drift == 0.0, drift
+    print(f"  [ok] key-shuffle drift on Noul: {drift:.4f} (exact, by construction)")
 
     # One RLCD step against SOFT targets.
     print("\n--- One RLCD training step (soft targets, not one-hots) ---")

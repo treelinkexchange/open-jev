@@ -58,7 +58,7 @@ automation viable. High-entropy-but-confident means "it really is 60/40, hedge".
 Low confidence means "escalate to a human or a reasoning model".
 
 Usage:
-    python jev.py        # builds a tiny model, runs a mixed query, trains a step
+    python -m open_jev.main  # builds a tiny model, runs a mixed query, trains a step
 
 Requires: torch >= 2.0
 """
@@ -66,6 +66,7 @@ Requires: torch >= 2.0
 from __future__ import annotations
 
 import math
+import warnings
 import zlib
 from dataclasses import dataclass, field
 from typing import Sequence
@@ -129,9 +130,9 @@ class JevConfig:
 class Noul:
     """Is this statement true? Returns a single calibrated probability.
 
-    Note there is no confidence field on the answer. For a binary, distance from
-    0.5 already carries that information, and the primitive is meant to drop
-    straight into an if-statement.
+    The answer carries an epistemic `confidence` like the other primitives.
+    Distance from 0.5 is aleatoric (the state is ambiguous); it cannot tell
+    "genuinely 50/50" from "no idea, escalate", which is the whole point.
     """
 
     text: str
@@ -178,6 +179,7 @@ Question = Noul | Choice | Score
 class NoulAnswer:
     key: str
     noul: float  # P(statement is true), in [0, 1]
+    confidence: float  # epistemic certainty, same meaning as Choice/Score
 
 
 @dataclass(frozen=True)
@@ -252,10 +254,10 @@ def flatten_state(
     Each token carries (depth, sibling_index, path_hash) instead of a flat
     position. Two consequences:
 
-      1. Reordering dict keys does not change any token's positional encoding,
-         so `{"a": 1, "b": 2}` and `{"b": 2, "a": 1}` encode identically. That is
-         a large part of the consistency guarantee, enforced by construction
-         rather than learned.
+      1. Dict keys are visited in sorted order, so `{"a": 1, "b": 2}` and
+         `{"b": 2, "a": 1}` produce identical token ids AND identical paths.
+         Key-order invariance is exact, enforced by construction rather than
+         learned. (List order is preserved: it is usually meaningful.)
       2. The model can tell `customer.name` from `agent.name` even when the leaf
          text is identical.
 
@@ -275,7 +277,12 @@ def flatten_state(
             paths.append((d, s, h))
 
     if isinstance(state, dict):
-        for i, (k, v) in enumerate(state.items()):
+        # Canonical key order. Without this, the sibling index and the flat
+        # position of every token depend on insertion order, so a shuffled
+        # dict encodes differently (upstream claimed otherwise; it drifted).
+        # Sorting makes key-order invariance exact, by construction.
+        items = sorted(state.items(), key=lambda kv: str(kv[0]))
+        for i, (k, v) in enumerate(items):
             child = f"{prefix}.{k}" if prefix else str(k)
             emit(str(k), depth, i, child)  # the key is content too
             sub_ids, sub_paths = flatten_state(
@@ -342,10 +349,16 @@ class BidirectionalBlock(nn.Module):
 class ReadoutBlock(nn.Module):
     """One layer of the read-out stack: slots read state, then talk among themselves.
 
-    The self-attention here is WITHIN a single question's slots only. Slots
-    belonging to different questions never meet, because questions are folded
-    into the batch dimension before this runs. That is what guarantees question
-    independence at the architecture level rather than by convention.
+    All N questions' slots share one sequence of length N*M per state, so the
+    state is never copied per question (upstream expanded it to [B*N, T, d]).
+    Independence is still structural:
+      * cross-attention: each query row attends to the state independently;
+        queries never see each other in cross-attention.
+      * slot self-attention: a block-diagonal mask confines each slot to the
+        slots of its own question.
+      * LayerNorm / FFN: per-token.
+    So adding or removing a question cannot change any other question's answer
+    (tested in tests/test_invariants.py).
     """
 
     def __init__(self, cfg: JevConfig) -> None:
@@ -361,8 +374,15 @@ class ReadoutBlock(nn.Module):
         )
         self.ffn = FeedForward(cfg)
 
-    def forward(self, slots: Tensor, state: Tensor, pad_mask: Tensor | None) -> Tensor:
-        """slots: [BN, M, d], state: [BN, T, d], pad_mask: [BN, T]."""
+    def forward(
+        self,
+        slots: Tensor,
+        state: Tensor,
+        pad_mask: Tensor | None,
+        slot_mask: Tensor | None = None,
+    ) -> Tensor:
+        """slots: [B, N*M, d], state: [B, T, d], pad_mask: [B, T],
+        slot_mask: [N*M, N*M] bool, True where attention is BLOCKED."""
         kv = self.cross_norm_kv(state)
         read, _ = self.cross(
             self.cross_norm_q(slots),
@@ -374,7 +394,7 @@ class ReadoutBlock(nn.Module):
         slots = slots + read
 
         h = self.self_norm(slots)
-        mixed, _ = self.slot_attn(h, h, h, need_weights=False)
+        mixed, _ = self.slot_attn(h, h, h, attn_mask=slot_mask, need_weights=False)
         return self.ffn(slots + mixed)
 
 
@@ -474,9 +494,9 @@ class ConfidenceHead(nn.Module):
         confidence = 1 - K / S
 
     Zero evidence -> alpha is uniform ones -> confidence 0 -> "I have no idea,
-    escalate". Crucially this is trained with a stop-gradient on the underlying
-    probabilities, so the confidence objective can never distort the prediction
-    it is describing.
+    escalate". The head reads a detached read-out vector (see Jev._heads)
+    and its target is computed under no_grad, so the confidence objective
+    trains only this head and cannot distort the prediction it describes.
     """
 
     def __init__(self, cfg: JevConfig) -> None:
@@ -592,6 +612,7 @@ class StateCache:
 
     hidden: Tensor  # [B, T, d]
     pad_mask: Tensor  # [B, T]
+    truncated: list[bool] = field(default_factory=list)  # per state: hit max_state_len
 
     @property
     def batch_size(self) -> int:
@@ -607,6 +628,11 @@ class Jev(nn.Module):
         3. Give each question M learned slots; cross-attend  O(N * M * T)
            into the frozen state through a deep read-out stack.
         4. Dispatch each slot bundle to its typed head.
+
+    Public API:
+        cache = model.encode_state(states)   # pay O(T^2) once
+        model.ask(cache, questions)          # cheap; call as often as you like
+        model(states, questions)             # convenience: encode + ask
     """
 
     def __init__(self, cfg: JevConfig, tokenizer: HashTokenizer | None = None) -> None:
@@ -631,13 +657,41 @@ class Jev(nn.Module):
         self.score_head = ScoreHead(cfg)
         self.confidence_head = ConfidenceHead(cfg)
 
+    @property
+    def _device(self) -> torch.device:
+        return next(self.parameters()).device
+
+    def validate(self, questions: Sequence[Question]) -> None:
+        """Enforce the config caps up front instead of failing deep in a head."""
+        if not questions:
+            raise ValueError("at least one question is required")
+        for q in questions:
+            if isinstance(q, Choice) and len(q.options) > self.cfg.max_options:
+                raise ValueError(
+                    f"Choice {q.key or q.text!r} has {len(q.options)} options; "
+                    f"max_options={self.cfg.max_options}. Run score-then-choose."
+                )
+            if isinstance(q, Score) and len(q.labels) > self.cfg.max_score_levels:
+                raise ValueError(
+                    f"Score {q.key or q.text!r} has {len(q.labels)} levels; "
+                    f"max_score_levels={self.cfg.max_score_levels}"
+                )
+
     def encode_state(self, states: Sequence[StateValue]) -> StateCache:
         """Encode a batch of JSON-like states. Cache and reuse this."""
-        device = next(self.parameters()).device
-        flat = [
-            flatten_state(s, self.tokenizer, self.cfg.max_state_len) for s in states
-        ]
-        T = max(len(ids) for ids, _ in flat)
+        device = self._device
+        limit = self.cfg.max_state_len
+        # Flatten one token past the limit so truncation is detectable.
+        raw = [flatten_state(s, self.tokenizer, limit + 1) for s in states]
+        truncated = [len(ids) > limit for ids, _ in raw]
+        if any(truncated):
+            warnings.warn(
+                f"{sum(truncated)} state(s) exceeded max_state_len={limit} "
+                "tokens and were truncated; see StateCache.truncated",
+                stacklevel=2,
+            )
+        flat = [(ids[:limit], pth[:limit]) for ids, pth in raw]
+        T = max(1, max(len(ids) for ids, _ in flat))
 
         ids = torch.zeros(len(flat), T, dtype=torch.long, device=device)
         paths = torch.zeros(len(flat), T, 3, dtype=torch.long, device=device)
@@ -645,8 +699,9 @@ class Jev(nn.Module):
 
         for i, (tok, pth) in enumerate(flat):
             n = len(tok)
-            ids[i, :n] = torch.tensor(tok, dtype=torch.long, device=device)
-            paths[i, :n] = torch.tensor(pth, dtype=torch.long, device=device)
+            if n:
+                ids[i, :n] = torch.tensor(tok, dtype=torch.long, device=device)
+                paths[i, :n] = torch.tensor(pth, dtype=torch.long, device=device)
             pad[i, :n] = False
 
         # An entirely-padded row makes MultiheadAttention softmax over nothing
@@ -655,17 +710,16 @@ class Jev(nn.Module):
         pad[:, 0] = False
 
         hidden = self.state_encoder(ids, paths, pad)
-        return StateCache(hidden=hidden, pad_mask=pad)
+        return StateCache(hidden=hidden, pad_mask=pad, truncated=truncated)
 
     def _readout(self, cache: StateCache, questions: Sequence[Question]) -> Tensor:
-        """Run all questions against one state. Returns pooled vectors [B*N, d].
+        """Run all questions against one state. Returns pooled vectors [B, N, d].
 
-        Questions are folded into the batch dimension, which is precisely why
-        they cannot interact: PyTorch's attention never crosses batch entries.
-        Independence is structural, not a convention we hope holds.
+        Slots for all N questions sit in one [B, N*M, d] sequence; a
+        block-diagonal mask keeps questions independent (see ReadoutBlock).
         """
-        device = next(self.parameters()).device
-        B, N = cache.batch_size, len(questions)
+        device = self._device
+        B, N, M = cache.batch_size, len(questions), self.cfg.n_slots
 
         q_ids, q_pad = self.tokenizer.encode_batch(
             [q.text for q in questions], self.cfg.max_question_len
@@ -677,127 +731,101 @@ class Jev(nn.Module):
         )
         q_emb = q_emb + self.type_emb(type_ids)
 
-        # [N, M, d] -> [B, N, M, d] -> [B*N, M, d]
-        slots = self.slot_init.unsqueeze(0) + q_emb.unsqueeze(1)
-        slots = (
-            slots.unsqueeze(0)
-            .expand(B, -1, -1, -1)
-            .reshape(B * N, self.cfg.n_slots, -1)
-        )
+        # [N, M, d] -> [B, N*M, d]  (expand is a view; no per-question state copy)
+        slots = (self.slot_init.unsqueeze(0) + q_emb.unsqueeze(1)).reshape(N * M, -1)
+        slots = slots.unsqueeze(0).expand(B, -1, -1)
 
-        # Each question sees the same state: [B, T, d] -> [B*N, T, d].
-        T = cache.hidden.shape[1]
-        state = cache.hidden.unsqueeze(1).expand(B, N, T, -1).reshape(B * N, T, -1)
-        pad = cache.pad_mask.unsqueeze(1).expand(B, N, T).reshape(B * N, T)
+        owner = torch.arange(N, device=device).repeat_interleave(M)  # [N*M]
+        slot_mask = owner.unsqueeze(0) != owner.unsqueeze(1)  # True = blocked
 
         for layer in self.readout:
-            slots = layer(slots, state, pad)
-        slots = self.readout_norm(slots)
+            slots = layer(slots, cache.hidden, cache.pad_mask, slot_mask)
+        slots = self.readout_norm(slots).reshape(B, N, M, -1)
 
-        return self.pool(torch.cat([slots.mean(1), slots[:, 0]], dim=-1))  # [B*N, d]
+        return self.pool(torch.cat([slots.mean(2), slots[:, :, 0]], dim=-1))  # [B, N, d]
 
     def _encode_options(self, options: Sequence[str]) -> Tensor:
-        device = next(self.parameters()).device
+        device = self._device
         ids, pad = self.tokenizer.encode_batch(list(options), self.cfg.max_question_len)
         return self.text_encoder(ids.to(device), pad.to(device))  # [K, d]
 
-    def forward(
-        self, states: Sequence[StateValue], questions: Sequence[Question]
-    ) -> list[list[Answer]]:
-        """Evaluate every question against every state.
-
-        Returns answers[batch_index][question_index]. One forward pass total,
-        regardless of how many questions you ask.
-        """
-        cache = self.encode_state(states)
-        pooled = self._readout(cache, questions)  # [B*N, d]
-        B, N = cache.batch_size, len(questions)
-
-        results: list[list[Answer]] = [[] for _ in range(B)]
-        for n, q in enumerate(questions):
-            idx = torch.arange(B, device=pooled.device) * N + n
-            vec = pooled[idx]  # [B, d]
-            key = q.key or f"q{n}"
-
-            if isinstance(q, Noul):
-                probs = torch.sigmoid(self.noul_head(vec))
-                for b in range(B):
-                    results[b].append(NoulAnswer(key=key, noul=probs[b].item()))
-
-            elif isinstance(q, Choice):
-                opts = self._encode_options(q.options).unsqueeze(0).expand(B, -1, -1)
-                mask = torch.ones(
-                    B, len(q.options), dtype=torch.bool, device=vec.device
-                )
-                probs = F.softmax(self.choice_head(vec, opts, mask), dim=-1)
-                conf, _ = self.confidence_head(vec, len(q.options))
-                for b in range(B):
-                    row = probs[b]
-                    results[b].append(
-                        ChoiceAnswer(
-                            key=key,
-                            choice=q.options[int(row.argmax())],
-                            probabilities={
-                                o: row[i].item() for i, o in enumerate(q.options)
-                            },
-                            confidence=conf[b].item(),
-                        )
-                    )
-
-            else:  # Score
-                probs = self.score_head(vec, len(q.labels))
-                levels = torch.arange(
-                    len(q.labels), dtype=probs.dtype, device=probs.device
-                )
-                expected = (probs * levels).sum(-1)
-                conf, _ = self.confidence_head(vec, len(q.labels))
-                for b in range(B):
-                    row = probs[b]
-                    results[b].append(
-                        ScoreAnswer(
-                            key=key,
-                            score=expected[b].item(),
-                            probabilities={
-                                lbl: row[i].item() for i, lbl in enumerate(q.labels)
-                            },
-                            confidence=conf[b].item(),
-                        )
-                    )
-
-        return results
-
-    def logits(
-        self, states: Sequence[StateValue], questions: Sequence[Question]
+    def _heads(
+        self, cache: StateCache, questions: Sequence[Question]
     ) -> list[tuple[Tensor, Tensor]]:
-        """Differentiable path for training: list of (probs [B, K], confidence [B]).
+        """Shared path for inference and training: (probs [B, K], confidence [B]).
 
-        Noul returns K=2 as [P(false), P(true)] so all three primitives share one
-        loss function.
+        Noul is returned as K=2, [P(false), P(true)], so every primitive shares
+        one loss. Confidence reads a DETACHED read-out vector: the confidence
+        objective trains only the confidence head and can never reshape the
+        representation behind the prediction it describes. (Upstream detached
+        only the target, so confidence gradients still reached the encoder.)
         """
-        cache = self.encode_state(states)
-        pooled = self._readout(cache, questions)
-        B, N = cache.batch_size, len(questions)
+        self.validate(questions)
+        pooled = self._readout(cache, questions)  # [B, N, d]
+        B = cache.batch_size
 
         out: list[tuple[Tensor, Tensor]] = []
         for n, q in enumerate(questions):
-            idx = torch.arange(B, device=pooled.device) * N + n
-            vec = pooled[idx]
-
+            vec = pooled[:, n]  # [B, d]
             if isinstance(q, Noul):
                 p_true = torch.sigmoid(self.noul_head(vec)).unsqueeze(-1)
                 probs = torch.cat([1 - p_true, p_true], dim=-1)
             elif isinstance(q, Choice):
                 opts = self._encode_options(q.options).unsqueeze(0).expand(B, -1, -1)
-                mask = torch.ones(
-                    B, len(q.options), dtype=torch.bool, device=vec.device
-                )
+                mask = torch.ones(B, len(q.options), dtype=torch.bool, device=vec.device)
                 probs = F.softmax(self.choice_head(vec, opts, mask), dim=-1)
             else:
                 probs = self.score_head(vec, len(q.labels))
 
-            conf, _ = self.confidence_head(vec, probs.shape[-1])
+            conf, _ = self.confidence_head(vec.detach(), probs.shape[-1])
             out.append((probs.clamp(min=1e-8), conf))
         return out
+
+    def ask(
+        self, cache: StateCache, questions: Sequence[Question]
+    ) -> list[list[Answer]]:
+        """Answer questions against an already-encoded state. No re-encoding."""
+        heads = self._heads(cache, questions)
+        results: list[list[Answer]] = [[] for _ in range(cache.batch_size)]
+        for n, (q, (probs, conf)) in enumerate(zip(questions, heads)):
+            key = q.key or f"q{n}"
+            for b in range(cache.batch_size):
+                row, c = probs[b], conf[b].item()
+                if isinstance(q, Noul):
+                    ans: Answer = NoulAnswer(key=key, noul=row[1].item(), confidence=c)
+                elif isinstance(q, Choice):
+                    ans = ChoiceAnswer(
+                        key=key,
+                        choice=q.options[int(row.argmax())],
+                        probabilities={o: row[i].item() for i, o in enumerate(q.options)},
+                        confidence=c,
+                    )
+                else:
+                    levels = torch.arange(len(q.labels), dtype=row.dtype, device=row.device)
+                    ans = ScoreAnswer(
+                        key=key,
+                        score=(row * levels).sum().item(),
+                        probabilities={l: row[i].item() for i, l in enumerate(q.labels)},
+                        confidence=c,
+                    )
+                results[b].append(ans)
+        return results
+
+    def forward(
+        self, states: Sequence[StateValue], questions: Sequence[Question]
+    ) -> list[list[Answer]]:
+        """Evaluate every question against every state (encode + ask).
+
+        Returns answers[batch_index][question_index]. For repeated queries
+        against the same state, call encode_state once and use ask().
+        """
+        return self.ask(self.encode_state(states), questions)
+
+    def logits(
+        self, states: Sequence[StateValue], questions: Sequence[Question]
+    ) -> list[tuple[Tensor, Tensor]]:
+        """Differentiable path for training: list of (probs [B, K], confidence [B])."""
+        return self._heads(self.encode_state(states), questions)
 
 
 # The single most important rule: NEVER train on hard labels.

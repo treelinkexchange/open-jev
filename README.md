@@ -1,3 +1,11 @@
+# Open Jev — TREELINK fork
+
+Fork of [kyegomez/open-jev](https://github.com/kyegomez/open-jev) at upstream
+commit `93843ef`, being developed toward a sovereign, self-hosted typed-decision
+model. See [FORK.md](FORK.md) for what changed and why. Upstream README follows.
+
+---
+
 # Open Jev
 
 An open-source, from-first-principles reconstruction of the ideas behind
@@ -52,7 +60,8 @@ not for training a useful model.
 ```bash
 git clone https://github.com/kyegomez/open-jev
 cd open-jev
-python -m pip install "torch>=2.0"
+python -m pip install -e ".[dev]"
+pytest
 ```
 
 Python 3.10 or newer is recommended.
@@ -109,7 +118,7 @@ were declared.
 To run the complete demo, including one calibration-oriented training step:
 
 ```bash
-python open_jev/main.py
+python example.py
 ```
 
 ## Training
@@ -140,8 +149,8 @@ For consistency training, pass semantically equivalent states through
 This repository explores an architecture inferred from public material. Details
 such as the encoder design, query slots, ordinal head, confidence objective, and
 training recipe are hypotheses, not disclosed details of TypeSafe AI's system.
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full reasoning and
-tradeoffs behind the reconstruction.
+The reasoning and tradeoffs behind the reconstruction are documented inline in
+[`open_jev/main.py`](open_jev/main.py).
 
 In particular, typed output prevents schema violations; it does not guarantee
 that a prediction is correct. Calibration must also be measured again under
